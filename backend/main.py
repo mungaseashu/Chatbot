@@ -22,6 +22,8 @@ from langchain_core.runnables import (
 )
 from langchain_core.output_parsers import StrOutputParser
 
+
+
 # -------------------- LOAD ENV --------------------
 load_dotenv()
 
@@ -36,6 +38,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+import os
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"message": "API running 🚀"}
+
+# IMPORTANT for Render
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
 
 # -------------------- GLOBAL CACHE --------------------
 vector_store_cache = {}
