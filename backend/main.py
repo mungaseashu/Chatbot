@@ -14,13 +14,10 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
-# -------------------- LOAD ENV --------------------
 load_dotenv()
 
-# -------------------- INIT APP --------------------
 app = FastAPI()
 
-# -------------------- CORS --------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,20 +26,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------- HEALTH CHECK --------------------
 @app.get("/")
 def root():
     return {"message": "API running 🚀"}
 
-# -------------------- REQUEST MODEL --------------------
 class ChatRequest(BaseModel):
     video_url: str
     question: str
 
-# -------------------- CACHE --------------------
+# ---------------- CACHE ----------------
 vector_store_cache = {}
 
-# -------------------- HELPERS --------------------
+# ---------------- HELPERS ----------------
 
 def extract_video_id(url: str) -> str:
     pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11})"
@@ -62,20 +57,23 @@ def get_transcript(video_id: str) -> str:
         raise HTTPException(status_code=404, detail="Transcript not available")
 
 
-def create_vector_store(transcript: str):
-    # ✅ LIGHTWEIGHT EMBEDDING (CRITICAL)
+def create_vector_store(video_id, transcript):
     embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+        model_name="BAAI/bge-base-en-v1.5"
     )
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
-
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     docs = splitter.create_documents([transcript])
 
-    return FAISS.from_documents(docs, embeddings)
+    db_path = f"db/{video_id}"
+
+    if os.path.exists(db_path):
+        return FAISS.load_local(db_path, embeddings, allow_dangerous_deserialization=True)
+
+    vector_store = FAISS.from_documents(docs, embeddings)
+    vector_store.save_local(db_path)
+
+    return vector_store
 
 
 def get_vector_store(video_id: str):
@@ -83,22 +81,32 @@ def get_vector_store(video_id: str):
         return vector_store_cache[video_id]
 
     transcript = get_transcript(video_id)
-    vs = create_vector_store(transcript)
+    vs = create_vector_store(video_id, transcript)
 
     vector_store_cache[video_id] = vs
     return vs
 
 
 def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+    return docs
 
-# -------------------- PROMPT --------------------
+
 prompt = PromptTemplate(
     template="""
-You are a helpful assistant.
-Answer ONLY from the transcript.
-If not found, say "I don't know".
+You are a helpful AI assistant.
 
+Answer the question using ONLY the provided transcript context.
+
+If the exact answer is not directly stated, you may:
+- infer logically from the context
+- summarize relevant parts
+
+But DO NOT use outside knowledge.
+
+If the context is completely unrelated, say:
+"I don't know based on the transcript."
+
+If user asks for summary → summarize the context.
 Context:
 {context}
 
@@ -108,40 +116,36 @@ Question:
     input_variables=["context", "question"]
 )
 
-# -------------------- MAIN API --------------------
 @app.post("/chat")
 def chat(request: ChatRequest):
-    try:
-        video_id = extract_video_id(request.video_url)
+    video_id = extract_video_id(request.video_url)
 
-        vector_store = get_vector_store(video_id)
-        retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+    vector_store = get_vector_store(video_id)
+    retriever = vector_store.as_retriever(search_kwargs={"k": 6})
 
-        # ✅ LOAD LLM INSIDE API (CRITICAL FIX)
-        llm = HuggingFaceEndpoint(
-            repo_id="Qwen/Qwen2.5-7B-Instruct",
-            task="conversational",
-            temperature=0.2
-        )
+    docs = retriever.invoke(request.question)
 
-        chat_model = ChatHuggingFace(llm=llm)
+    context = "\n\n".join([d.page_content for d in docs])
 
-        chain = (
-            RunnableParallel({
-                "context": retriever | RunnableLambda(format_docs),
-                "question": RunnablePassthrough()
-            })
-            | prompt
-            | RunnableLambda(lambda x: x.to_string())
-            | chat_model
-            | StrOutputParser()
-        )
+    llm = HuggingFaceEndpoint(
+        repo_id="Qwen/Qwen2.5-7B-Instruct",
+        task="conversational",
+        temperature=0.2
+    )
 
-        answer = chain.invoke(request.question)
+    chat_model = ChatHuggingFace(llm=llm)
 
-        return {"answer": answer}
+    final_prompt = prompt.format(
+    context=context,
+    question=request.question
+)
 
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    answer = chat_model.invoke(final_prompt)
+
+    # 🔥 SOURCES
+    sources = [doc.page_content[:120] for doc in docs]
+
+    return {
+        "answer": answer.content,
+        "sources": sources
+    }
